@@ -1,9 +1,9 @@
 name: Controlla nuovi annunci Muse su Mercari
 
 on:
+  workflow_dispatch:   # fatto scattare da cron-job.org ogni 5 minuti tramite l'API di GitHub
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:   # permette di avviarlo manualmente dalla tab "Actions" per testare
+    - cron: "17 * * * *"   # riserva: una volta all'ora, nel caso cron-job.org sia giù
 
 permissions:
   contents: write   # serve per poter salvare seen_items.json nel repository
