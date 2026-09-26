@@ -7,6 +7,9 @@ un'ondata di notifiche quando se ne aggiunge una nuova in futuro): al
 primo giro segna tutto come già visto senza notificare, dal giro dopo
 notifica solo i nuovi annunci.
 
+Se una ricerca fallisce (es. Mercari temporaneamente irraggiungibile),
+viene mandato un avviso su Telegram invece di fallire in silenzio.
+
 Variabili d'ambiente richieste:
     TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID
@@ -40,11 +43,15 @@ SEARCHES = [
         "categories": None,
     },
     {
-        "label": "Muse promo",
-        "query": "Muse",
-        "categories": None,  # niente categoria dedicata su Mercari: filtra il testo
+        "label": "Muse Promo",
+        "query": "Muse promo",
+        "categories": None,
     },
 ]
+
+# pausa tra una ricerca e l'altra nella stessa esecuzione, per non
+# bombardare Mercari con più richieste ravvicinate tutte insieme
+PAUSE_BETWEEN_SEARCHES_SECONDS = 3
 
 EXCLUDE_KEYWORD = ""  # parole da escludere lato server, valide per tutte le ricerche
 TITLE_BLACKLIST: list[str] = []  # es. ["nintendo switch", "profumo"]
@@ -65,8 +72,7 @@ def load_state() -> dict:
         raw = STATE_FILE.read_text().strip()
         if raw and raw != "[]":
             data = json.loads(raw)
-            # compatibilita' col vecchio formato (una lista semplice di id)
-            if isinstance(data, list):
+            if isinstance(data, list):  # compatibilita' col vecchio formato
                 return {"seen_ids": data, "initialized_labels": [s["label"] for s in SEARCHES]}
             return data
     return {"seen_ids": [], "initialized_labels": []}
@@ -132,14 +138,20 @@ async def main():
     mercapi = Mercapi()
 
     async with httpx.AsyncClient() as client:
-        for profile in SEARCHES:
+        for i, profile in enumerate(SEARCHES):
             label = profile["label"]
             is_first_run_for_this_search = label not in initialized_labels
+
+            if i > 0:
+                await asyncio.sleep(PAUSE_BETWEEN_SEARCHES_SECONDS)
 
             try:
                 items = await run_search(mercapi, profile)
             except Exception as exc:
                 print(f"Errore nella ricerca '{label}': {exc}")
+                await send_telegram_message(
+                    client, f"⚠️ La ricerca '{label}' è fallita in questo giro: {exc}"
+                )
                 continue
 
             new_items = [item for item in items if item.id_ not in seen_ids]
@@ -147,7 +159,7 @@ async def main():
             for item in new_items:
                 seen_ids.add(item.id_)
                 if is_first_run_for_this_search:
-                    continue  # prima volta per questa ricerca: segna e basta, niente notifica
+                    continue
                 print(f"Nuovo annuncio [{label}]: {item.name}")
                 await send_telegram_message(client, format_message(item, label))
 
