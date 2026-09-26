@@ -1,0 +1,34 @@
+name: Controlla nuovi annunci Muse su Mercari
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:   # permette di avviarlo manualmente dalla tab "Actions" per testare
+
+permissions:
+  contents: write   # serve per poter salvare seen_items.json nel repository
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installa le dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Esegui il controllo
+        run: python monitor.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Salva lo stato aggiornato nel repository
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Aggiorna elenco annunci controllati"
+          file_pattern: "seen_items.json last_check.txt"
