@@ -1,7 +1,11 @@
 """
-Monitor Mercari per nuovi annunci "Muse" (CD) - versione a esecuzione
-singola, pensata per essere lanciata periodicamente da GitHub Actions
-(non ha un loop interno: fa un controllo e termina).
+Monitor Mercari per annunci "Muse" - versione a esecuzione singola con
+supporto a più ricerche indipendenti, pensata per GitHub Actions.
+
+Ogni ricerca ha una sua "prima esecuzione silenziosa" (per non ricevere
+un'ondata di notifiche quando se ne aggiunge una nuova in futuro): al
+primo giro segna tutto come già visto senza notificare, dal giro dopo
+notifica solo i nuovi annunci.
 
 Variabili d'ambiente richieste:
     TELEGRAM_BOT_TOKEN
@@ -19,20 +23,33 @@ from mercapi import Mercapi
 from mercapi.requests import SearchRequestData
 
 # ----------------------------------------------------------------------------
-# CONFIGURAZIONE
+# CONFIGURAZIONE - una ricerca per riga. "categories" puo' essere None se
+# per quel tipo di prodotto Mercari non ha una categoria dedicata (es. le
+# musicassette): in quel caso il filtro lo fa solo il testo della query.
 # ----------------------------------------------------------------------------
 
-SEARCH_QUERY = "Muse"
+SEARCHES = [
+    {
+        "label": "Muse CD",
+        "query": "Muse",
+        "categories": [75],  # "CD" (tutte le sottocategorie: occidentale, giapponese, ecc.)
+    },
+    {
+        "label": "Muse Cassette",
+        "query": "Muse cassette",  # niente categoria dedicata su Mercari: filtra il testo
+        "categories": None,
+    },
+    {
+        "label": "Muse promo",
+        "query": "Muse",
+        "categories": None,  # niente categoria dedicata su Mercari: filtra il testo
+    },
+]
 
-# ID categoria Mercari "CD > 洋楽" (musica occidentale).
-# Usare [75] per includere TUTTE le sottocategorie CD (musica giapponese,
-# anime, classica, K-pop...) se in futuro si vuole allargare la ricerca.
-CATEGORY_IDS = [695]
-
-EXCLUDE_KEYWORD = ""  # parole da escludere lato server, es. "profumo maglietta"
+EXCLUDE_KEYWORD = ""  # parole da escludere lato server, valide per tutte le ricerche
 TITLE_BLACKLIST: list[str] = []  # es. ["nintendo switch", "profumo"]
 
-SEEN_FILE = Path(__file__).parent / "seen_items.json"
+STATE_FILE = Path(__file__).parent / "seen_items.json"
 STATUS_FILE = Path(__file__).parent / "last_check.txt"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -43,14 +60,20 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # PERSISTENZA (il file viene poi ricommittato nel repo dal workflow)
 # ----------------------------------------------------------------------------
 
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
-    return set()
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        raw = STATE_FILE.read_text().strip()
+        if raw and raw != "[]":
+            data = json.loads(raw)
+            # compatibilita' col vecchio formato (una lista semplice di id)
+            if isinstance(data, list):
+                return {"seen_ids": data, "initialized_labels": [s["label"] for s in SEARCHES]}
+            return data
+    return {"seen_ids": [], "initialized_labels": []}
 
 
-def save_seen(seen: set) -> None:
-    SEEN_FILE.write_text(json.dumps(sorted(seen)))
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state))
 
 
 # ----------------------------------------------------------------------------
@@ -65,52 +88,74 @@ async def send_telegram_message(client: httpx.AsyncClient, text: str) -> None:
         print(f"Invio Telegram fallito ({resp.status_code}): {resp.text}")
 
 
-def format_message(item) -> str:
+def format_message(item, label: str) -> str:
     price = "prezzo non impostato" if item.is_no_price else f"¥{item.price:,}"
     item_url = f"https://jp.mercari.com/item/{item.id_}"
     return (
-        f"🎵 <b>{item.name}</b>\n{price}\n{item_url}\n\n"
+        f"🎵 <b>{item.name}</b>\n[{label}] {price}\n{item_url}\n\n"
         f"Per comprarlo: incolla questo link nella barra di ricerca di ZenMarket."
     )
 
 
 # ----------------------------------------------------------------------------
-# MAIN (esecuzione singola)
+# RICERCA
 # ----------------------------------------------------------------------------
 
-async def main():
-    seen = load_seen()
-    first_run = not seen  # al primissimo avvio non notifichiamo tutto lo storico
+async def run_search(mercapi: Mercapi, profile: dict):
+    kwargs = {}
+    if profile.get("categories"):
+        kwargs["categories"] = profile["categories"]
 
-    results = await Mercapi().search(
-        SEARCH_QUERY,
-        categories=CATEGORY_IDS,
+    results = await mercapi.search(
+        profile["query"],
         status=[SearchRequestData.Status.STATUS_ON_SALE],
         sort_by=SearchRequestData.SortBy.SORT_CREATED_TIME,
         sort_order=SearchRequestData.SortOrder.ORDER_DESC,
         exclude=EXCLUDE_KEYWORD,
+        **kwargs,
     )
-
-    new_items = [
+    return [
         item for item in results.items
-        if item.id_ not in seen
-        and not any(w.lower() in item.name.lower() for w in TITLE_BLACKLIST)
+        if not any(w.lower() in item.name.lower() for w in TITLE_BLACKLIST)
     ]
 
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+
+async def main():
+    state = load_state()
+    seen_ids = set(state.get("seen_ids", []))
+    initialized_labels = set(state.get("initialized_labels", []))
+
+    mercapi = Mercapi()
+
     async with httpx.AsyncClient() as client:
-        for item in new_items:
-            seen.add(item.id_)
-            if first_run:
+        for profile in SEARCHES:
+            label = profile["label"]
+            is_first_run_for_this_search = label not in initialized_labels
+
+            try:
+                items = await run_search(mercapi, profile)
+            except Exception as exc:
+                print(f"Errore nella ricerca '{label}': {exc}")
                 continue
-            print(f"Nuovo annuncio: {item.name}")
-            await send_telegram_message(client, format_message(item))
 
-    if first_run and new_items:
-        print(f"Primo avvio: {len(new_items)} annunci esistenti segnati come già visti.")
+            new_items = [item for item in items if item.id_ not in seen_ids]
 
-    save_seen(seen)
-    # timestamp aggiornato ad ogni run, cosi' c'e' sempre qualcosa da committare
-    # e il workflow schedulato non viene disattivato per inattivita' del repo
+            for item in new_items:
+                seen_ids.add(item.id_)
+                if is_first_run_for_this_search:
+                    continue  # prima volta per questa ricerca: segna e basta, niente notifica
+                print(f"Nuovo annuncio [{label}]: {item.name}")
+                await send_telegram_message(client, format_message(item, label))
+
+            if is_first_run_for_this_search:
+                initialized_labels.add(label)
+                print(f"Prima esecuzione per '{label}': {len(new_items)} annunci segnati come già visti.")
+
+    save_state({"seen_ids": sorted(seen_ids), "initialized_labels": sorted(initialized_labels)})
     STATUS_FILE.write_text(datetime.now(timezone.utc).isoformat())
 
 
