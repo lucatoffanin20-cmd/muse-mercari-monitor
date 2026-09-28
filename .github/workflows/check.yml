@@ -5,6 +5,13 @@ on:
   schedule:
     - cron: "17 * * * *"   # riserva: una volta all'ora, nel caso cron-job.org sia giù
 
+# non far partire due esecuzioni in contemporanea: se una è già in corso,
+# la successiva aspetta in coda invece di girare in parallelo (evita che
+# due run provino a salvare seen_items.json nello stesso momento)
+concurrency:
+  group: muse-mercari-monitor
+  cancel-in-progress: false
+
 permissions:
   contents: write   # serve per poter salvare seen_items.json nel repository
 
