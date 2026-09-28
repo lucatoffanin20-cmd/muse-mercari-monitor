@@ -1,14 +1,7 @@
 """
-Monitor Mercari per annunci "Muse" - versione a esecuzione singola con
-supporto a più ricerche indipendenti, pensata per GitHub Actions.
-
-Ogni ricerca ha una sua "prima esecuzione silenziosa" (per non ricevere
-un'ondata di notifiche quando se ne aggiunge una nuova in futuro): al
-primo giro segna tutto come già visto senza notificare, dal giro dopo
-notifica solo i nuovi annunci.
-
-Se una ricerca fallisce (es. Mercari temporaneamente irraggiungibile),
-viene mandato un avviso su Telegram invece di fallire in silenzio.
+Monitor Mercari per annunci "Muse" - con più ricerche indipendenti,
+titolo tradotto in italiano e foto dell'annuncio nella notifica.
+Pensata per essere lanciata periodicamente da GitHub Actions.
 
 Variabili d'ambiente richieste:
     TELEGRAM_BOT_TOKEN
@@ -22,39 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+from deep_translator import GoogleTranslator
 from mercapi import Mercapi
 from mercapi.requests import SearchRequestData
 
 # ----------------------------------------------------------------------------
-# CONFIGURAZIONE - una ricerca per riga. "categories" puo' essere None se
-# per quel tipo di prodotto Mercari non ha una categoria dedicata (es. le
-# musicassette): in quel caso il filtro lo fa solo il testo della query.
+# CONFIGURAZIONE
 # ----------------------------------------------------------------------------
 
 SEARCHES = [
-    {
-        "label": "Muse CD",
-        "query": "Muse",
-        "categories": [75],  # "CD" (tutte le sottocategorie: occidentale, giapponese, ecc.)
-    },
-    {
-        "label": "Muse Cassette",
-        "query": "Muse cassette",  # niente categoria dedicata su Mercari: filtra il testo
-        "categories": None,
-    },
-    {
-        "label": "Muse Promo",
-        "query": "Muse promo",
-        "categories": None,
-    },
+    {"label": "Muse CD", "query": "Muse", "categories": [75]},
+    {"label": "Muse Cassette", "query": "Muse cassette", "categories": None},
+    {"label": "Muse Promo", "query": "Muse promo", "categories": None},
 ]
 
-# pausa tra una ricerca e l'altra nella stessa esecuzione, per non
-# bombardare Mercari con più richieste ravvicinate tutte insieme
 PAUSE_BETWEEN_SEARCHES_SECONDS = 3
 
-EXCLUDE_KEYWORD = ""  # parole da escludere lato server, valide per tutte le ricerche
-TITLE_BLACKLIST: list[str] = []  # es. ["nintendo switch", "profumo"]
+EXCLUDE_KEYWORD = ""
+TITLE_BLACKLIST: list[str] = []
 
 STATE_FILE = Path(__file__).parent / "seen_items.json"
 STATUS_FILE = Path(__file__).parent / "last_check.txt"
@@ -62,9 +40,11 @@ STATUS_FILE = Path(__file__).parent / "last_check.txt"
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+translator = GoogleTranslator(source="ja", target="it")
+
 
 # ----------------------------------------------------------------------------
-# PERSISTENZA (il file viene poi ricommittato nel repo dal workflow)
+# PERSISTENZA
 # ----------------------------------------------------------------------------
 
 def load_state() -> dict:
@@ -72,7 +52,7 @@ def load_state() -> dict:
         raw = STATE_FILE.read_text().strip()
         if raw and raw != "[]":
             data = json.loads(raw)
-            if isinstance(data, list):  # compatibilita' col vecchio formato
+            if isinstance(data, list):
                 return {"seen_ids": data, "initialized_labels": [s["label"] for s in SEARCHES]}
             return data
     return {"seen_ids": [], "initialized_labels": []}
@@ -83,24 +63,59 @@ def save_state(state: dict) -> None:
 
 
 # ----------------------------------------------------------------------------
+# TRADUZIONE (best-effort: se fallisce, usiamo il titolo originale)
+# ----------------------------------------------------------------------------
+
+def translate_title(text: str) -> str | None:
+    try:
+        translated = translator.translate(text)
+        return translated if translated else None
+    except Exception as exc:
+        print(f"Traduzione fallita per '{text}': {exc}")
+        return None
+
+
+# ----------------------------------------------------------------------------
 # TELEGRAM
 # ----------------------------------------------------------------------------
 
-async def send_telegram_message(client: httpx.AsyncClient, text: str) -> None:
+async def send_telegram_text(client: httpx.AsyncClient, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     resp = await client.post(url, json=payload, timeout=15)
     if resp.status_code != 200:
-        print(f"Invio Telegram fallito ({resp.status_code}): {resp.text}")
+        print(f"Invio Telegram (testo) fallito ({resp.status_code}): {resp.text}")
 
 
-def format_message(item, label: str) -> str:
+async def send_telegram_photo(client: httpx.AsyncClient, photo_url: str, caption: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "photo": photo_url,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    resp = await client.post(url, json=payload, timeout=15)
+    if resp.status_code != 200:
+        print(f"Invio Telegram (foto) fallito ({resp.status_code}): {resp.text} — riprovo come testo")
+        await send_telegram_text(client, caption)
+
+
+async def notify_new_item(client: httpx.AsyncClient, item, label: str) -> None:
+    translated = translate_title(item.name)
     price = "prezzo non impostato" if item.is_no_price else f"¥{item.price:,}"
     item_url = f"https://jp.mercari.com/item/{item.id_}"
-    return (
-        f"🎵 <b>{item.name}</b>\n[{label}] {price}\n{item_url}\n\n"
+
+    title_block = f"🎵 <b>{translated}</b>\n<i>{item.name}</i>" if translated else f"🎵 <b>{item.name}</b>"
+    caption = (
+        f"{title_block}\n[{label}] {price}\n{item_url}\n\n"
         f"Per comprarlo: incolla questo link nella barra di ricerca di ZenMarket."
     )
+
+    if item.thumbnails:
+        await send_telegram_photo(client, item.thumbnails[0], caption)
+    else:
+        await send_telegram_text(client, caption)
 
 
 # ----------------------------------------------------------------------------
@@ -149,7 +164,7 @@ async def main():
                 items = await run_search(mercapi, profile)
             except Exception as exc:
                 print(f"Errore nella ricerca '{label}': {exc}")
-                await send_telegram_message(
+                await send_telegram_text(
                     client, f"⚠️ La ricerca '{label}' è fallita in questo giro: {exc}"
                 )
                 continue
@@ -161,7 +176,7 @@ async def main():
                 if is_first_run_for_this_search:
                     continue
                 print(f"Nuovo annuncio [{label}]: {item.name}")
-                await send_telegram_message(client, format_message(item, label))
+                await notify_new_item(client, item, label)
 
             if is_first_run_for_this_search:
                 initialized_labels.add(label)
