@@ -1,7 +1,7 @@
 """
-Monitor Mercari per annunci "Muse" - con più ricerche indipendenti,
-titolo tradotto in italiano e foto dell'annuncio nella notifica.
-Pensata per essere lanciata periodicamente da GitHub Actions.
+Monitor Mercari per annunci "Muse" - più ricerche indipendenti, titolo
+tradotto in italiano, foto nella notifica, errori isolati per singolo
+annuncio. Pensata per essere lanciata periodicamente da GitHub Actions.
 
 Variabili d'ambiente richieste:
     TELEGRAM_BOT_TOKEN
@@ -9,6 +9,7 @@ Variabili d'ambiente richieste:
 """
 
 import asyncio
+import html
 import json
 import os
 from datetime import datetime, timezone
@@ -23,13 +24,20 @@ from mercapi.requests import SearchRequestData
 # CONFIGURAZIONE
 # ----------------------------------------------------------------------------
 
+# Categoria "CD" (75) + tutte le sue sottocategorie elencate esplicitamente
+# (694 giapponese, 695 occidentale, 696 anime, 697 classica, 698 K-POP/Asia,
+# 699 bambini, 700 altro): cosi' funziona sia che Mercari espanda da solo
+# la categoria madre sia che non lo faccia.
+CD_CATEGORIES = [75, 694, 695, 696, 697, 698, 699, 700]
+
 SEARCHES = [
-    {"label": "Muse CD", "query": "Muse", "categories": [75]},
+    {"label": "Muse CD", "query": "Muse", "categories": CD_CATEGORIES},
     {"label": "Muse Cassette", "query": "Muse cassette", "categories": None},
     {"label": "Muse Promo", "query": "Muse promo", "categories": None},
 ]
 
 PAUSE_BETWEEN_SEARCHES_SECONDS = 3
+MAX_PAGES_PER_SEARCH = 3  # fino a 360 risultati (120 per pagina)
 
 EXCLUDE_KEYWORD = ""
 TITLE_BLACKLIST: list[str] = []
@@ -76,46 +84,68 @@ def translate_title(text: str) -> str | None:
 
 
 # ----------------------------------------------------------------------------
-# TELEGRAM
+# TELEGRAM - ogni funzione restituisce True/False, cosi' sappiamo davvero
+# se il messaggio e' partito (prima un errore di Telegram veniva ignorato
+# e l'annuncio risultava "gia' notificato" anche se non era arrivato nulla)
 # ----------------------------------------------------------------------------
 
-async def send_telegram_text(client: httpx.AsyncClient, text: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    resp = await client.post(url, json=payload, timeout=15)
+async def _post_telegram(client: httpx.AsyncClient, method: str, payload: dict) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        resp = await client.post(url, json=payload, timeout=15)
+    except Exception as exc:
+        print(f"Telegram {method}: errore di rete: {exc}")
+        return False
     if resp.status_code != 200:
-        print(f"Invio Telegram (testo) fallito ({resp.status_code}): {resp.text}")
+        print(f"Telegram {method} fallito ({resp.status_code}): {resp.text}")
+        return False
+    return True
 
 
-async def send_telegram_photo(client: httpx.AsyncClient, photo_url: str, caption: str) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+async def send_telegram_text(client: httpx.AsyncClient, text: str, html_mode: bool = True) -> bool:
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if html_mode:
+        payload["parse_mode"] = "HTML"
+    return await _post_telegram(client, "sendMessage", payload)
+
+
+async def send_telegram_photo(client: httpx.AsyncClient, photo_url: str, caption: str) -> bool:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "photo": photo_url,
         "caption": caption,
         "parse_mode": "HTML",
     }
-    resp = await client.post(url, json=payload, timeout=15)
-    if resp.status_code != 200:
-        print(f"Invio Telegram (foto) fallito ({resp.status_code}): {resp.text} — riprovo come testo")
-        await send_telegram_text(client, caption)
+    return await _post_telegram(client, "sendPhoto", payload)
 
 
 async def notify_new_item(client: httpx.AsyncClient, item, label: str) -> None:
     translated = translate_title(item.name)
     price = "prezzo non impostato" if item.is_no_price else f"¥{item.price:,}"
     item_url = f"https://jp.mercari.com/item/{item.id_}"
+    footer = "Per comprarlo: incolla questo link nella barra di ricerca di ZenMarket."
 
-    title_block = f"🎵 <b>{translated}</b>\n<i>{item.name}</i>" if translated else f"🎵 <b>{item.name}</b>"
-    caption = (
-        f"{title_block}\n[{label}] {price}\n{item_url}\n\n"
-        f"Per comprarlo: incolla questo link nella barra di ricerca di ZenMarket."
-    )
-
-    if item.thumbnails:
-        await send_telegram_photo(client, item.thumbnails[0], caption)
+    # versione HTML: i caratteri speciali nei titoli (&, <, >) vanno "protetti",
+    # altrimenti Telegram rifiuta il messaggio con errore 400
+    if translated:
+        title_html = f"🎵 <b>{html.escape(translated, quote=False)}</b>\n<i>{html.escape(item.name, quote=False)}</i>"
+        title_plain = f"🎵 {translated}\n{item.name}"
     else:
-        await send_telegram_text(client, caption)
+        title_html = f"🎵 <b>{html.escape(item.name, quote=False)}</b>"
+        title_plain = f"🎵 {item.name}"
+
+    caption_html = f"{title_html}\n[{html.escape(label, quote=False)}] {price}\n{item_url}\n\n{footer}"
+    caption_plain = f"{title_plain}\n[{label}] {price}\n{item_url}\n\n{footer}"
+
+    # tentativi in ordine: foto -> testo formattato -> testo semplice
+    if item.thumbnails and await send_telegram_photo(client, item.thumbnails[0], caption_html):
+        return
+    if await send_telegram_text(client, caption_html):
+        return
+    if await send_telegram_text(client, caption_plain, html_mode=False):
+        return
+
+    raise RuntimeError("tutti i tentativi di invio su Telegram sono falliti")
 
 
 # ----------------------------------------------------------------------------
@@ -135,8 +165,21 @@ async def run_search(mercapi: Mercapi, profile: dict):
         exclude=EXCLUDE_KEYWORD,
         **kwargs,
     )
+    all_items = list(results.items)
+
+    page = 1
+    while (
+        page < MAX_PAGES_PER_SEARCH
+        and results.meta.num_found > len(all_items)
+        and results.meta.next_page_token
+    ):
+        await asyncio.sleep(1)
+        results = await results.next_page()
+        all_items.extend(results.items)
+        page += 1
+
     return [
-        item for item in results.items
+        item for item in all_items
         if not any(w.lower() in item.name.lower() for w in TITLE_BLACKLIST)
     ]
 
@@ -165,18 +208,25 @@ async def main():
             except Exception as exc:
                 print(f"Errore nella ricerca '{label}': {exc}")
                 await send_telegram_text(
-                    client, f"⚠️ La ricerca '{label}' è fallita in questo giro: {exc}"
+                    client, f"⚠️ La ricerca '{label}' è fallita in questo giro: {exc}", html_mode=False
                 )
                 continue
 
             new_items = [item for item in items if item.id_ not in seen_ids]
 
             for item in new_items:
-                seen_ids.add(item.id_)
                 if is_first_run_for_this_search:
+                    seen_ids.add(item.id_)
                     continue
-                print(f"Nuovo annuncio [{label}]: {item.name}")
-                await notify_new_item(client, item, label)
+
+                try:
+                    await notify_new_item(client, item, label)
+                    seen_ids.add(item.id_)  # segnato come visto SOLO se la notifica e' partita davvero
+                    print(f"Nuovo annuncio notificato [{label}]: {item.name}")
+                except Exception as exc:
+                    # non blocchiamo l'intera esecuzione per un singolo annuncio:
+                    # non essendo segnato come visto, ci riproveremo al giro successivo
+                    print(f"Notifica fallita per '{item.name}' [{label}]: {exc}")
 
             if is_first_run_for_this_search:
                 initialized_labels.add(label)
