@@ -30,14 +30,25 @@ from mercapi.requests import SearchRequestData
 # la categoria madre sia che non lo faccia.
 CD_CATEGORIES = [75, 694, 695, 696, 697, 698, 699, 700]
 
+# Categoria "Vinili/Record" (1160) + sottocategorie (1161 giapponese,
+# 1162 occidentale, 1163 altro)
+RECORD_CATEGORIES = [1160, 1161, 1162, 1163]
+
+# Cerchiamo il nome della band solo con "Muse"/"ミューズ" (senza parole come
+# "CD"), perche' molti venditori non scrivono il formato nel titolo: a
+# restringere il campo ci pensa la categoria. Le cassette non hanno una
+# categoria dedicata su Mercari, quindi li' serve la parola "cassette".
 SEARCHES = [
     {"label": "Muse CD", "query": "Muse", "categories": CD_CATEGORIES},
+    {"label": "Muse Vinili", "query": "Muse", "categories": RECORD_CATEGORIES},
+    {"label": "ミューズ CD/Vinili", "query": "ミューズ", "categories": CD_CATEGORIES + RECORD_CATEGORIES},
     {"label": "Muse Cassette", "query": "Muse cassette", "categories": None},
+    {"label": "ミューズ カセット", "query": "ミューズ カセット", "categories": None},
     {"label": "Muse Promo", "query": "Muse promo", "categories": None},
 ]
 
 PAUSE_BETWEEN_SEARCHES_SECONDS = 3
-MAX_PAGES_PER_SEARCH = 3  # fino a 360 risultati (120 per pagina)
+MAX_PAGES_PER_SEARCH = 5  # fino a 600 risultati (120 per pagina)
 
 EXCLUDE_KEYWORD = ""
 TITLE_BLACKLIST: list[str] = []
@@ -178,10 +189,11 @@ async def run_search(mercapi: Mercapi, profile: dict):
         all_items.extend(results.items)
         page += 1
 
-    return [
+    filtered = [
         item for item in all_items
         if not any(w.lower() in item.name.lower() for w in TITLE_BLACKLIST)
     ]
+    return filtered, results.meta.num_found
 
 
 # ----------------------------------------------------------------------------
@@ -204,7 +216,7 @@ async def main():
                 await asyncio.sleep(PAUSE_BETWEEN_SEARCHES_SECONDS)
 
             try:
-                items = await run_search(mercapi, profile)
+                items, num_found = await run_search(mercapi, profile)
             except Exception as exc:
                 print(f"Errore nella ricerca '{label}': {exc}")
                 await send_telegram_text(
@@ -213,6 +225,8 @@ async def main():
                 continue
 
             new_items = [item for item in items if item.id_ not in seen_ids]
+            # riepilogo nel log: se "totali" supera "letti" qualcosa resta fuori dalla finestra
+            print(f"[{label}] totali su Mercari: {num_found} | letti: {len(items)} | nuovi: {len(new_items)}")
 
             for item in new_items:
                 if is_first_run_for_this_search:
