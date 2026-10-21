@@ -12,6 +12,8 @@ import asyncio
 import html
 import json
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -160,6 +162,26 @@ async def notify_new_item(client: httpx.AsyncClient, item, label: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# FILTRO DI PERTINENZA - Mercari a volte restituisce annunci che non
+# contengono affatto le parole cercate. Notifichiamo solo se il TITOLO
+# nomina la band o un titolo di album/singolo dei Muse (modificabile).
+# ----------------------------------------------------------------------------
+
+MUSE_ALBUM_TITLES = [
+    "showbiz", "origin of symmetry", "absolution", "black holes and revelations",
+    "the 2nd law", "simulation theory", "will of the people", "plug in baby",
+    "hullabaloo", "muscle museum",
+]
+
+
+def is_relevant(item) -> bool:
+    text = unicodedata.normalize("NFKC", item.name).lower()
+    if re.search(r"(?<![a-z])muse(?![a-z])", text) or "ミューズ" in text:
+        return True
+    return any(title in text for title in MUSE_ALBUM_TITLES)
+
+
+# ----------------------------------------------------------------------------
 # RICERCA
 # ----------------------------------------------------------------------------
 
@@ -212,6 +234,10 @@ async def main():
             label = profile["label"]
             is_first_run_for_this_search = label not in initialized_labels
 
+            if not profile["query"].strip():
+                print(f"Ricerca '{label}' saltata: la query e' vuota")
+                continue
+
             if i > 0:
                 await asyncio.sleep(PAUSE_BETWEEN_SEARCHES_SECONDS)
 
@@ -226,7 +252,15 @@ async def main():
 
             new_items = [item for item in items if item.id_ not in seen_ids]
             # riepilogo nel log: se "totali" supera "letti" qualcosa resta fuori dalla finestra
-            print(f"[{label}] totali su Mercari: {num_found} | letti: {len(items)} | nuovi: {len(new_items)}")
+            relevant_items = [item for item in new_items if is_relevant(item)]
+            discarded = [item for item in new_items if not is_relevant(item)]
+            for item in discarded:
+                seen_ids.add(item.id_)  # non pertinente: lo segno come visto cosi' non lo rivaluto
+            print(
+                f"[{label}] totali su Mercari: {num_found} | letti: {len(items)} | "
+                f"nuovi: {len(new_items)} | scartati (titolo senza Muse): {len(discarded)}"
+            )
+            new_items = relevant_items
 
             for item in new_items:
                 if is_first_run_for_this_search:
