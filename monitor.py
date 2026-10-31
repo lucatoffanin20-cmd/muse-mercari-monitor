@@ -43,10 +43,8 @@ RECORD_CATEGORIES = [1160, 1161, 1162, 1163]
 SEARCHES = [
     {"label": "Muse CD", "query": "Muse", "categories": CD_CATEGORIES},
     {"label": "Muse Vinili", "query": "Muse", "categories": RECORD_CATEGORIES},
-    {"label": "ミューズ CD/Vinili", "query": "ミューズ", "categories": CD_CATEGORIES + RECORD_CATEGORIES},
     {"label": "Muse Cassette", "query": "Muse cassette", "categories": None},
-    {"label": "ミューズ カセット", "query": "ミューズ カセット", "categories": None},
-    {"label": "Muse Promo", "query": "Muse promo", "categories": None},
+    {"label": "Muse カセット", "query": "Muse カセット", "categories": None},
 ]
 
 PAUSE_BETWEEN_SEARCHES_SECONDS = 3
@@ -163,22 +161,80 @@ async def notify_new_item(client: httpx.AsyncClient, item, label: str) -> None:
 
 # ----------------------------------------------------------------------------
 # FILTRO DI PERTINENZA - Mercari a volte restituisce annunci che non
-# contengono affatto le parole cercate. Notifichiamo solo se il TITOLO
-# nomina la band o un titolo di album/singolo dei Muse (modificabile).
+# contengono le parole cercate, e "Muse" da solo e' un nome molto comune.
+# Notifichiamo SOLO se il titolo contiene "Muse" E almeno una voce di questo
+# elenco (album, EP, live, singoli e brani dal 1999). Solo alfabeto latino.
+# Il confronto ignora maiuscole, trattini e apostrofi particolari.
+# Se una voce fa passare troppa roba che non c'entra (parole molto comuni,
+# tipo "euphoria" o "animals"), cancellala da qui.
 # ----------------------------------------------------------------------------
 
-MUSE_ALBUM_TITLES = [
+MUSE_TITLES = [
+    # --- album, EP, live ---
     "showbiz", "origin of symmetry", "absolution", "black holes and revelations",
-    "the 2nd law", "simulation theory", "will of the people", "plug in baby",
-    "hullabaloo", "muscle museum",
+    "black holes & revelations", "the resistance", "the 2nd law", "2nd law", "drones",
+    "simulation theory", "will of the people", "hullabaloo", "haarp",
+    "live at rome", "live at wembley", "muse ep", "muscle museum ep",
+    # --- Showbiz (1999) ---
+    "sunburn", "muscle museum", "fillip", "falling down", "cave", "unintended", "uno",
+    "sober", "escape", "overdue", "hate this and i'll love you", "hate this & i'll love you",
+    "coma", "jimmy kane", "yes please", "agitated", "nature 1", "pink ego box",
+    # --- Origin of Symmetry (2001) ---
+    "new born", "bliss", "space dementia", "hyper music", "hyper chondriac music",
+    "plug in baby", "plugin baby", "citizen erased", "micro cuts", "screenager",
+    "darkshines", "feeling good", "megalomania", "futurism", "shine",
+    # --- tra i due album e Absolution ---
+    "dead star", "in your world", "execution commentary",
+    # --- Absolution (2003) ---
+    "apocalypse please", "time is running out", "sing for absolution", "stockholm syndrome",
+    "falling away with you", "hysteria", "blackout", "butterflies and hurricanes",
+    "butterflies & hurricanes", "the small print", "endlessly", "thoughts of a dying atheist",
+    "ruled by secrecy", "fury", "eternally missed", "do we need this",
+    # --- Black Holes and Revelations (2006) ---
+    "take a bow", "starlight", "supermassive black hole", "map of the problematique",
+    "soldier's poem", "invincible", "assassin", "exo politics", "city of delusion",
+    "hoodoo", "knights of cydonia", "glorious", "easily", "crying shame",
+    "shrinking universe",
+    # --- The Resistance (2009) ---
+    "uprising", "resistance", "undisclosed desires", "united states of eurasia",
+    "guiding light", "unnatural selection", "mk ultra", "i belong to you",
+    "exogenesis", "cross pollination", "redemption",
+    # --- The 2nd Law (2012) ---
+    "supremacy", "madness", "panic station", "survival", "follow me", "animals",
+    "explorers", "big freeze", "save me", "liquid state", "unsustainable",
+    "isolated system",
+    # --- Drones (2015) ---
+    "dead inside", "psycho", "mercy", "reapers", "the handler", "defector", "revolt",
+    "aftermath", "the globalist", "jfk",
+    # --- Simulation Theory (2018) ---
+    "algorithm", "the dark side", "pressure", "propaganda", "break it to me",
+    "something human", "thought contagion", "get up and fight", "blockades",
+    "dig down", "the void",
+    # --- Will of the People (2022) ---
+    "will of the people", "compliance", "liberation", "won't stand down", "ghosts",
+    "you make me feel like it's halloween", "kill or be killed", "verona", "euphoria",
 ]
 
 
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).lower()
+    text = text.replace("\u2019", "'").replace("\u2018", "'").replace("`", "'")
+    text = re.sub(r"[-\u2010-\u2015_/]", " ", text)  # trattini e slash -> spazio
+    return re.sub(r"\s+", " ", text)
+
+
+_NORMALIZED_TITLES = sorted({_normalize(t) for t in MUSE_TITLES})
+
+
+def _has_word(text: str, phrase: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", text) is not None
+
+
 def is_relevant(item) -> bool:
-    text = unicodedata.normalize("NFKC", item.name).lower()
-    if re.search(r"(?<![a-z])muse(?![a-z])", text) or "ミューズ" in text:
-        return True
-    return any(title in text for title in MUSE_ALBUM_TITLES)
+    text = _normalize(item.name)
+    if not _has_word(text, "muse"):
+        return False
+    return any(_has_word(text, title) for title in _NORMALIZED_TITLES)
 
 
 # ----------------------------------------------------------------------------
@@ -258,7 +314,7 @@ async def main():
                 seen_ids.add(item.id_)  # non pertinente: lo segno come visto cosi' non lo rivaluto
             print(
                 f"[{label}] totali su Mercari: {num_found} | letti: {len(items)} | "
-                f"nuovi: {len(new_items)} | scartati (titolo senza Muse): {len(discarded)}"
+                f"nuovi: {len(new_items)} | scartati (senza Muse + titolo noto): {len(discarded)}"
             )
             new_items = relevant_items
 
